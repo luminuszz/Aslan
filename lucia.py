@@ -5,7 +5,6 @@ import gc
 import logging
 import os
 import queue
-import select
 import shutil
 import subprocess
 import sys
@@ -35,10 +34,7 @@ TRANSCRIPTION_DIR = os.getenv(
     "OBSIDIAN_TRANSCRIPT_DIR",
     "/home/daviribeiro/Documents/obsidian-storage/davi-brain/brain/transcricoes",
 )
-TEMP_DIR = os.getenv(
-    "OBSIDIAN_TEMP_RAW",
-    "/home/daviribeiro/.temp",
-)
+TEMP_DIR = ".temp"
 MODEL_NAME = "medium"
 LANGUAGE = "pt"
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -76,14 +72,38 @@ def synthesize_summary_ollama(transcriptions: list[str]) -> str:
 
     log.info("Enviando transcrição para o Ollama (%s)...", OLLAMA_MODEL)
 
+    data_atual = datetime.now().strftime("%Y-%m-%d")
+    hora_atual = datetime.now().strftime("%H:%M")
+
     prompt = f"""
-    Você é uma assistente executiva focado em síntese, seu nome é Lucia. Abaixo está a transcrição de uma reunião corporativa.
-    Seu objetivo é fornecer:
-    1. Um resumo executivo de 1 parágrafo.
-    2. Os principais tópicos discutidos (em tópicos).
-    3. Decisões tomadas.
-    4. Pontos de ação (Action Items) com seus respectivos responsáveis (se mencionados).
-    Não adicione informações que não estão no texto original.
+    Você é um assistente estruturando notas para o Obsidian.
+    Analise a seguinte transcrição de reunião.
+
+    RETORNE EXATAMENTE NESTE FORMATO MARKDOWN, respeitando rigorosamente a sintaxe YAML no frontmatter:
+
+    ---
+    data: {data_atual}
+    hora: {hora_atual}
+    tipo: reuniao
+    participantes: ["[[Nome1]]", "[[Nome2]]"]
+    projetos: [Projeto 1, Projeto 2]
+    tags: [tag1, tag2, tag3]
+    ---
+
+    # Resumo da Reunião
+    [Um parágrafo de resumo]
+
+    ## Tópicos Discutidos
+    [Liste em bullet points. IMPORTANTE: Sempre que mencionar uma pessoa, projeto, ferramenta ou cliente no corpo do texto, coloque entre colchetes duplos para criar um link no Obsidian. Ex: [[João]], [[Projeto X]]]
+
+    ## Próximos Passos (Action Items)
+    - [ ] [Tarefa 1] - responsável: [[Nome da Pessoa]]
+    - [ ] [Tarefa 2] - responsável: [[Nome da Pessoa]]
+
+    REGRAS IMPORTANTES PARA O FRONTMATTER (YAML):
+    1. A propriedade "tags" NUNCA deve conter o símbolo "#". Retorne apenas as palavras dentro dos colchetes.
+    2. As propriedades "participantes" e "projetos" devem estar no formato de lista YAML estrito, com todos os itens separados por vírgula dentro de apenas UM par de colchetes.
+    3. Se usar links "[[ ]]" dentro dos colchetes do YAML (como na lista de participantes), você DEVE colocar cada link entre aspas duplas. Exemplo correto: ["[[João]]", "[[Maria]]"].
 
     Transcrição:
     {full_text}
@@ -114,18 +134,18 @@ def summarize_existing_file(filepath: str):
     with open(filepath, "r", encoding="utf-8") as f:
         content = f.read()
 
-    if "## 🧠 Resumo Executivo (IA)" in content:
+    if "## 🧠 Resumo Executivo (IA)" in content or "# Resumo da Reunião" in content:
         log.warning("Este arquivo aparentemente já possui um resumo.")
         return
 
     resumo = synthesize_summary_ollama([content])
 
-    with open(filepath, "a", encoding="utf-8") as f:
-        f.write("\n---\n## 🧠 Resumo Executivo (IA)\n\n")
+    with open(filepath, "w", encoding="utf-8") as f:
         f.write(resumo)
-        f.write("\n")
+        f.write("\n\n---\n\n## Transcrição Original\n\n")
+        f.write(content)
 
-    log.info("✅ Resumo gerado e anexado com sucesso!")
+    log.info("✅ Resumo gerado e inserido no início do arquivo!")
 
 
 # -------------------------------
@@ -352,10 +372,15 @@ def process_audio(audio_path: str, md_path: str):
     )
     resumo_ia = synthesize_summary_ollama(transcribed_texts)
 
-    with open(md_path, "a", encoding="utf-8") as md_file:
-        md_file.write("\n---\n## 🧠 Resumo Executivo (IA)\n\n")
+    # Ler a transcrição que acabamos de escrever
+    with open(md_path, "r", encoding="utf-8") as md_file:
+        transcricao = md_file.read()
+
+    # Reescrever o arquivo com o resumo no topo
+    with open(md_path, "w", encoding="utf-8") as md_file:
         md_file.write(resumo_ia)
-        md_file.write("\n")
+        md_file.write("\n\n---\n\n## Transcrição Original\n\n")
+        md_file.write(transcricao)
 
     log.info("✅ Sucesso! Transcrição salva perfeitamente em: %s", md_path)
 
@@ -370,24 +395,10 @@ def batch_transcription():
     audio_queues = [queue.Queue() for _ in device_ids]
     stop_event = threading.Event()
 
-    # --- CONFIGURAÇÕES DE AUTO-STOP ---
-    MAX_DURATION_SEC = 40 * 60  # 40 minutos de limite total
-    MAX_SILENCE_SEC = 5 * 60  # 5 minutos contínuos sem áudio para abortar
-    SILENCE_THRESHOLD = 0.015  # Limiar de volume (0.0 a 1.0)
-
-    start_time = time.time()
-    last_audio_time = time.time()
-
     def make_callback(q):
         def callback(indata, frames, time_info, status):
-            nonlocal last_audio_time
             if status:
                 log.debug(f"Aviso de áudio: {status}")
-
-            # Checa se o pico de volume do chunk supera o limiar de silêncio
-            if np.max(np.abs(indata)) > SILENCE_THRESHOLD:
-                last_audio_time = time.time()
-
             q.put(indata.copy())
 
         return callback
@@ -429,37 +440,10 @@ def batch_transcription():
         writer_thread.start()
 
         print("\n" + "=" * 60)
-        print(" 🔴 GRAVANDO...")
-        print(" 🛑 Pressione [ENTER] para parar e processar manualmente.")
-        print(
-            f" ⏳ Parada automática: {MAX_DURATION_SEC // 60}min total ou {MAX_SILENCE_SEC // 60}min de silêncio."
-        )
+        input(" 🔴 GRAVANDO... Pressione [ENTER] para parar e processar.")
         print("=" * 60 + "\n")
 
-        # --- LOOP DE CONTROLE PRINCIPAL ---
-        while not stop_event.is_set():
-            # 1. Verifica teclado de forma não-bloqueante (timeout de 0.5s)
-            dr, dw, de = select.select([sys.stdin], [], [], 0.5)
-            if dr:
-                sys.stdin.readline()
-                log.info("⏹️ Gravação interrompida manualmente.")
-                stop_event.set()
-                break
-
-            now = time.time()
-
-            # 2. Trava de tempo máximo (40 minutos)
-            if now - start_time >= MAX_DURATION_SEC:
-                log.info("⏰ Limite de 40 minutos atingido. Processando áudio...")
-                stop_event.set()
-                break
-
-            # 3. Trava de inatividade (Silêncio prolongado)
-            if now - last_audio_time >= MAX_SILENCE_SEC:
-                log.info("🔇 Muito tempo sem áudio detectado. Processando áudio...")
-                stop_event.set()
-                break
-
+        stop_event.set()
         writer_thread.join()
 
     finally:
